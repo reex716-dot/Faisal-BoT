@@ -1,0 +1,343 @@
+import asyncio
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timedelta
+from pyrogram import Client, filters, idle
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions
+from pyrogram.enums import ParseMode, ChatMemberStatus
+from pyrogram.errors import FloodWait, RPCError
+
+# --- إعدادات البيانات الخاصة بك ---
+API_ID = 34257542
+API_HASH = "614a1b5c5b712ac6de5530d5c571c42a"
+BOT_TOKEN = "8576422165:AAFS1w9OrSoq5yLISbfNw60VilfHpdBqmgY"
+MY_USER_ID = 1486879970 
+
+# ملفات البيانات
+REPLIES_FILE = "auto_replies.json"
+WARNS_FILE = "user_warns.json"
+MEDIA_FILE = "media_replies.json"
+MEDIA_INDEX_FILE = "media_index.json"
+STATUS_FILE = "bot_status.txt" 
+REMINDERS_FILE = "reminders.json"
+
+def load_data(file_path, default_value):
+    if os.path.exists(file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            try: return json.load(f)
+            except: return default_value
+    return default_value
+
+def save_data(file_path, data):
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception as e: print(f"Error saving data to {file_path}: {e}")
+
+# تحميل البيانات
+auto_replies = load_data(REPLIES_FILE, {"السلام عليكم": "وعليكم السلام"})
+user_warns = load_data(WARNS_FILE, {})
+media_replies = load_data(MEDIA_FILE, {})
+media_indices = load_data(MEDIA_INDEX_FILE, {})
+reminders = load_data(REMINDERS_FILE, {})
+
+waiting_for_media = {}
+waiting_for_reminder = {}
+active_mentions = set()
+
+# إعداد البوت
+app = Client(
+    "mention_session_v16", 
+    api_id=API_ID, 
+    api_hash=API_HASH, 
+    bot_token=BOT_TOKEN,
+    workers=100, 
+    ipv6=False   
+)
+
+async def update_status_loop():
+    while True:
+        try:
+            with open(STATUS_FILE, "w") as f:
+                f.write(str(int(time.time())))
+        except: pass
+        await asyncio.sleep(15)
+
+async def is_admin(client, user_id, chat_id):
+    if user_id == MY_USER_ID: return True
+    try:
+        member = await client.get_chat_member(chat_id, user_id)
+        return member.status in [ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR]
+    except: return False
+
+# --- ميزة رسالة الترحيب للأعضاء الجدد ---
+@app.on_message(filters.new_chat_members & filters.group)
+async def welcome_new_members(client, message):
+    for member in message.new_chat_members:
+        if not member.is_bot:
+            welcome_text = f"""أهلاً بك في قروب فجر جديد 🌅
+[{member.first_name}](tg://user?id={member.id})
+هنا نبدأ صفحة مختلفة…
+
+• ممنوع السلبية ❌
+• ممنوع نشر أي محتوى غير لائق ❌
+• ممنوع الإحباط أو التقليل من عزيمة الآخرين ❌
+• الدعم والتشجيع واجب بيننا 🤝
+• هدفنا التعافي… ليس الكمال ✅"""
+            await message.reply(welcome_text)
+
+# --- ميزة التذكير الدوري ---
+async def reminder_loop(client, chat_id, reminder_text, interval_seconds):
+    """حلقة التذكير المستمرة"""
+    while True:
+        chat_id_str = str(chat_id)
+        if chat_id_str not in reminders or not reminders[chat_id_str].get("active", False):
+            break
+        
+        try:
+            await client.send_message(chat_id, f"تذكير ⏰\n\n{reminder_text}")
+        except Exception as e:
+            print(f"Error sending reminder: {e}")
+        
+        await asyncio.sleep(interval_seconds)
+
+@app.on_message(filters.command(["تذكير"], prefixes=["", "/", "!"]) & filters.group)
+async def start_reminder(client, message):
+    if not message.from_user or not await is_admin(client, message.from_user.id, message.chat.id):
+        return await message.reply("للمشرفين فقط 🚫")
+    
+    waiting_for_reminder[message.from_user.id] = {"chat_id": message.chat.id, "step": "text"}
+    await message.reply("حسناً، قم بإضافة التذكير ⏳\n\nأرسل نص التذكير الآن:")
+
+@app.on_message(filters.text & filters.group, group=2)
+async def receive_reminder_data(client, message):
+    if not message.from_user or message.from_user.id not in waiting_for_reminder:
+        return
+    
+    user_data = waiting_for_reminder[message.from_user.id]
+    
+    if user_data["step"] == "text":
+        user_data["text"] = message.text.strip()
+        user_data["step"] = "interval"
+        await message.reply(
+            "تم حفظ نص التذكير ✅\n\n"
+            "الآن حدد مدة التذكير:\n"
+            "• اكتب: `كل 3 ساعات` أو `كل ساعة`\n"
+            "• اكتب: `كل يوم`\n"
+            "• اكتب: `كل اسبوع`\n"
+            "• اكتب: `كل 30 دقيقة`"
+        )
+    
+    elif user_data["step"] == "interval":
+        text = message.text.strip().lower()
+        interval_seconds = None
+        
+        # تحليل المدة الزمنية بشكل حرفي
+        if "دقيقة" in text or "دقائق" in text:
+            match = re.search(r'(\d+)', text)
+            if match:
+                minutes = int(match.group(1))
+                interval_seconds = minutes * 60
+        elif "ساعة" in text or "ساعات" in text:
+            match = re.search(r'(\d+)', text)
+            hours = int(match.group(1)) if match else 1
+            interval_seconds = hours * 3600
+        elif "يوم" in text or "ايام" in text:
+            match = re.search(r'(\d+)', text)
+            days = int(match.group(1)) if match else 1
+            interval_seconds = days * 86400
+        elif "اسبوع" in text or "أسبوع" in text:
+            match = re.search(r'(\d+)', text)
+            weeks = int(match.group(1)) if match else 1
+            interval_seconds = weeks * 604800
+        
+        if interval_seconds:
+            chat_id_str = str(user_data["chat_id"])
+            if chat_id_str in reminders:
+                reminders[chat_id_str]["active"] = False
+            
+            reminders[chat_id_str] = {
+                "text": user_data["text"],
+                "interval": interval_seconds,
+                "active": True
+            }
+            save_data(REMINDERS_FILE, reminders)
+            asyncio.create_task(reminder_loop(client, user_data["chat_id"], user_data["text"], interval_seconds))
+            
+            await message.reply(f"تم تفعيل التذكير بنجاح ✅\n\n📝 النص: {user_data['text']}\n⏰ المدة: {text}")
+            del waiting_for_reminder[message.from_user.id]
+        else:
+            await message.reply("صيغة خاطئة! حاول مرة أخرى ❌\nمثال: `كل 3 ساعات` أو `كل يوم`")
+
+@app.on_message(filters.command(["ايقاف التذكير", "إيقاف التذكير"], prefixes=["", "/", "!"]) & filters.group)
+async def stop_reminder_cmd(client, message):
+    if not message.from_user or not await is_admin(client, message.from_user.id, message.chat.id):
+        return await message.reply("للمشرفين فقط 🚫")
+    
+    chat_id_str = str(message.chat.id)
+    if chat_id_str in reminders:
+        reminders[chat_id_str]["active"] = False
+        save_data(REMINDERS_FILE, reminders)
+        await message.reply("تم إيقاف التذكير ✅")
+    else:
+        await message.reply("لا يوجد تذكير نشط ❌")
+
+# --- ميزة حذف الصور والفيديوهات ---
+@app.on_message(filters.regex(r"^احذف\s+(فيديو|صورة)\s*\((.*?)\)") & filters.group)
+async def delete_media(client, message):
+    if not message.from_user or not await is_admin(client, message.from_user.id, message.chat.id):
+        return await message.reply("للمشرفين فقط 🚫")
+    
+    media_type = "video" if "فيديو" in message.text else "photo"
+    match = re.search(r"\((.*?)\)", message.text)
+    
+    if match:
+        name = match.group(1).strip()
+        if name in media_replies:
+            del media_replies[name]
+            save_data(MEDIA_FILE, media_replies)
+            if name in media_indices:
+                del media_indices[name]
+                save_data(MEDIA_INDEX_FILE, media_indices)
+            await message.reply(f"تم حذف ال{'فيديو' if media_type == 'video' else 'صورة'}: `{name}` 🗑️")
+        else:
+            await message.reply(f"لم يتم العثور على: `{name}` ❌")
+
+# --- ميزة الإنذارات ---
+@app.on_message(filters.command(["warn", "انذار"], prefixes=["", "/", "!"]) & filters.group)
+async def warn_user(client, message):
+    if not message.from_user or not await is_admin(client, message.from_user.id, message.chat.id):
+        return await message.reply("للمشرفين فقط 🚫")
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        return await message.reply("رد على رسالة الشخص ⚠️")
+    target = message.reply_to_message.from_user
+    if target.is_bot or await is_admin(client, target.id, message.chat.id):
+        return await message.reply("لا يمكن إنذاره ❌")
+    
+    cid, uid = str(message.chat.id), str(target.id)
+    if cid not in user_warns: user_warns[cid] = {}
+    user_warns[cid][uid] = user_warns[cid].get(uid, 0) + 1
+    save_data(WARNS_FILE, user_warns)
+
+    if user_warns[cid][uid] >= 3:
+        try:
+            await client.restrict_chat_member(message.chat.id, target.id, ChatPermissions(can_send_messages=False), until_date=datetime.now() + timedelta(hours=2))
+            user_warns[cid][uid] = 0
+            save_data(WARNS_FILE, user_warns)
+            await message.reply(f"تم كتم {target.first_name} لمدة ساعتين (3 إنذارات) 🚫")
+        except: await message.reply("فشل الكتم ❌")
+    else:
+        await message.reply(f"إنذار لـ {target.first_name} ({user_warns[cid][uid]}/3) ⚠️")
+
+# --- ميزة الميديا والردود ---
+@app.on_message(filters.regex(r"^(فيديو|صورة)\s*\((.*?)\)") & filters.group)
+async def start_add_media(client, message):
+    if not message.from_user or not await is_admin(client, message.from_user.id, message.chat.id): return
+    m_type, name = ("video" if "فيديو" in message.text else "photo"), message.matches[0].group(2).strip()
+    if name:
+        waiting_for_media[message.from_user.id] = {"name": name, "type": m_type}
+        await message.reply(f"أرسل ال{'فيديو' if m_type == 'video' else 'صورة'} الآن.")
+
+@app.on_message((filters.video | filters.photo) & filters.group)
+async def receive_media(client, message):
+    uid = message.from_user.id if message.from_user else None
+    if uid in waiting_for_media:
+        info = waiting_for_media[uid]
+        fid = message.video.file_id if info["type"] == "video" and message.video else message.photo.file_id if info["type"] == "photo" and message.photo else None
+        if fid:
+            if info["name"] not in media_replies: media_replies[info["name"]] = {"type": info["type"], "ids": []}
+            media_replies[info["name"]]["ids"].append(fid)
+            save_data(MEDIA_FILE, media_replies)
+            del waiting_for_media[uid]
+            await message.reply(f"تم الإضافة: `{info['name']}` ✅")
+
+@app.on_message(filters.command("اضف رد", prefixes=["", "/", "!"]) & filters.group)
+async def add_reply_cmd(client, message):
+    if not message.from_user or not await is_admin(client, message.from_user.id, message.chat.id): return
+    m = re.search(r"\((.*?)\)\s*\((.*?)\)", message.text, re.DOTALL)
+    if m:
+        auto_replies[m.group(1).strip()] = m.group(2).strip()
+        save_data(REPLIES_FILE, auto_replies)
+        await message.reply(f"تم إضافة الرد: `{m.group(1).strip()}` ✅")
+
+@app.on_message(filters.command("حذف رد", prefixes=["", "/", "!"]) & filters.group)
+async def del_reply_cmd(client, message):
+    if not message.from_user or not await is_admin(client, message.from_user.id, message.chat.id): return
+    m = re.search(r"\((.*?)\)", message.text, re.DOTALL)
+    if m:
+        k = m.group(1).strip()
+        if k in auto_replies: del auto_replies[k]; save_data(REPLIES_FILE, auto_replies)
+        if k in media_replies: del media_replies[k]; save_data(MEDIA_FILE, media_replies)
+        await message.reply(f"تم الحذف: `{k}` 🗑️")
+
+# --- الردود التلقائية (حرفية تماماً) ---
+@app.on_message(filters.text & filters.group, group=1)
+async def auto_reply_handler(client, message):
+    if not message.text: return
+    t = message.text.strip()
+    
+    # التحقق الحرفي فقط
+    if t in auto_replies: 
+        await message.reply(auto_replies[t])
+    elif t in media_replies:
+        d = media_replies[t]
+        ids = d["ids"]
+        if ids:
+            idx = media_indices.get(t, 0) % len(ids)
+            try:
+                if d["type"] == "video": await message.reply_video(ids[idx])
+                else: await message.reply_photo(ids[idx])
+                media_indices[t] = idx + 1
+                save_data(MEDIA_INDEX_FILE, media_indices)
+            except Exception: pass
+
+# --- المنشن (all) ---
+async def mention_task(client, chat_id, msg, members):
+    for i in range(0, len(members), 5):
+        if chat_id not in active_mentions: break
+        try:
+            await client.send_message(chat_id, " ".join(members[i:i+5]) + f"\n\n**{msg}**")
+            await asyncio.sleep(4) 
+        except FloodWait as e: await asyncio.sleep(e.value)
+        except: break
+    active_mentions.discard(chat_id)
+
+@app.on_message(filters.command(["all", "mentionall"], prefixes=["", "/", "."]) & filters.group)
+async def mentionall(client, message):
+    if not message.from_user or not await is_admin(client, message.from_user.id, message.chat.id): return
+    if message.chat.id in active_mentions: return await message.reply("جاري المنشن بالفعل ⚠️")
+    
+    msg = message.text.split(None, 1)[1] if len(message.command) > 1 else "نداء للجميع 📣"
+    active_mentions.add(message.chat.id)
+    
+    members = []
+    async for m in client.get_chat_members(message.chat.id):
+        if m.user and not m.user.is_bot:
+            members.append(f"@{m.user.username}" if m.user.username else f"[{m.user.first_name}](tg://user?id={m.user.id})")
+    
+    asyncio.create_task(mention_task(client, message.chat.id, msg, members))
+    await message.reply(f"بدأ المنشن لـ {len(members)} عضو ✅")
+
+@app.on_message(filters.command(["cancel", "stop"], prefixes=["/", "."]) & filters.group)
+async def cancel_spam(client, message):
+    active_mentions.discard(message.chat.id)
+    await message.reply('توقف ✅')
+
+# --- استعادة التذكيرات عند بدء البوت ---
+async def restore_reminders():
+    await asyncio.sleep(5)
+    for chat_id_str, reminder_data in reminders.items():
+        if reminder_data.get("active", False):
+            chat_id = int(chat_id_str)
+            asyncio.create_task(reminder_loop(app, chat_id, reminder_data["text"], reminder_data["interval"]))
+
+if __name__ == "__main__":
+    try:
+        print("Bot v17.2 LIVE! (Literal Matching + Emoji Fixed)")
+        asyncio.get_event_loop().create_task(restore_reminders())
+        app.run()
+    except KeyboardInterrupt:
+        pass
