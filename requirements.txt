@@ -1,2 +1,5 @@
 https://github.com/kurimuzard/pyrogram/archive/v2.0.106.zip
 tgcrypto
+pyrogram
+apscheduler
+dateparser
