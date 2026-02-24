@@ -13,7 +13,7 @@ from pyrogram.errors import FloodWait, RPCError
 # --- إعدادات البيانات الخاصة بك ---
 API_ID = 34257542
 API_HASH = "614a1b5c5b712ac6de5530d5c571c42a"
-BOT_TOKEN = "8576422165:AAFS1w9OrSoq5yLISbfNw60VilfHpdBqmgY"
+BOT_TOKEN = "8514118433:AAEvB4nWdb6qkMUq8WsY-SWzgmQmxOmyMzQ"
 MY_USER_ID = 1486879970 
 
 # ملفات البيانات
